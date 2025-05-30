@@ -1,0 +1,519 @@
+---
+title: "DraftR flat file"
+execute:
+  echo: false
+  warning: false
+  message: false
+  eval: false
+---
+
+# DraftR package
+
+Diese Quarto-Datei dient als Grundlage für {fusen} um das Package **DraftR** zu
+bauen. Alle bisher in den Skripten vorhandenen Funktionen wurden hier
+übernommen.
+
+## Zotero und TLDR Workflow Funktionen
+
+```{r get_collection_key_by_name}
+#' Get collection key by name
+#'
+#' @param collection_name Name der Collection
+#' @param library_type Typ der Zotero Library
+#' @param library_id ID der Zotero Library
+#' @param api_key API-Key
+#' @return Character string mit dem Collection Key
+#' @export
+get_collection_key_by_name <- function(collection_name, library_type, library_id, api_key) {
+  base_url <- glue("https://api.zotero.org/{library_type}s/{library_id}/collections")
+  resp <- request(base_url) |> req_headers("Zotero-API-Key" = api_key) |> req_perform()
+  collections <- resp_body_json(resp, simplifyVector = FALSE)
+  collection <- detect(collections, ~ .x$data$name == collection_name)
+  if (is.null(collection)) stop("Collection nicht gefunden.")
+  collection$key
+}
+```
+
+```{r download_pdf_from_cloud_temporarily}
+#' Download PDF from cloud temporarily
+#'
+#' @param zotero_id Zotero Identifier
+#' @return Pfad zur heruntergeladenen PDF-Datei
+#' @export
+download_pdf_from_cloud_temporarily <- function(zotero_id) {
+  base_url <- "https://uni-bielefeld.sciebo.de/s/Jn1xMawAp1IFYbC/download"
+  file_url <- glue("{base_url}?path=/&files={zotero_id}.zip")
+  temp_zip <- tempfile(fileext = ".zip")
+  resp <- request(file_url) |> req_perform(path = temp_zip)
+  if (!resp_status(resp) %in% 200:299) stop("Fehler beim Download: ", zotero_id)
+  temp_unzip_dir <- tempfile(); dir.create(temp_unzip_dir)
+  utils::unzip(temp_zip, exdir = temp_unzip_dir)
+  pdf_files <- list.files(temp_unzip_dir, pattern = "\\.pdf$", full.names = TRUE)
+  if (length(pdf_files) == 0) stop("Kein PDF in ZIP: ", zotero_id)
+  file.remove(temp_zip)
+  pdf_files[[1]]
+}
+```
+
+```{r convert_pdf_to_markdown}
+#' Convert a PDF to Markdown text
+#'
+#' @param pdf_path Pfad zur PDF-Datei
+#' @return Markdown Text als character
+#' @export
+convert_pdf_to_markdown <- function(pdf_path) {
+  md <- ragnar::read_as_markdown(pdf_path)        # char-Vektor je Absatz/Zeile
+  paste(md, collapse = "\n")                      # zu einem String vereinen
+}
+```
+
+```{r create_tldr_for_pdf}
+#' Create TLDR for PDF content
+#'
+#' @param pdf_md_text Markdown Text aus der PDF
+#' @param ellmer_model Modell für ellmer::chat_openai
+#' @return TLDR-Text
+#' @export
+create_tldr_for_pdf <- function(pdf_md_text, ellmer_model) {
+  chat <- ellmer::chat_openai(model = ellmer_model, echo = TRUE)
+  chat$chat(
+    "Formuliere ein deutschsprachiges TLDR für den Text der Publikation, den man in einen Absatz zur Literaturübersicht einer wissenschaftlichen Arbeit einfügen kann. Erwähne im ersten Satz die Autoren (z.B. 'Smith et al.'). Ergänze konkrete Aussagen zu Effekten mit den Effektstärken und füge am Ende jedes entsprechenden Satzes die Referenz [@DOI], z. B. [@10.3205/zma001642] ein. Kontrolliere anhand des Abstracts und gib nur das endgültige TLDR aus.",
+    pdf_md_text
+  )
+}
+```
+
+```{r get_rcr_data}
+#' Retrieve iCite RCR data
+#'
+#' @param pmids Vektor mit PubMed IDs
+#' @return Tabelle mit RCR Daten
+#' @export
+get_rcr_data <- function(pmids) {
+  if (!length(pmids)) return(tibble())
+  url <- "https://icite.od.nih.gov/api/pubs"
+  batch_size <- 200; all_data <- list(); i <- 1
+  while (i <= length(pmids)) {
+    batch <- pmids[i:min(i + batch_size - 1, length(pmids))]
+    resp  <- request(url) |> req_url_query(pmids = paste(batch, collapse = ",")) |> req_perform()
+    j     <- resp_body_json(resp)
+    recs  <- lapply(j$data, function(pub) list(
+      pmid = pub$pmid %||% NA, doi = pub$doi %||% NA,
+      relative_citation_ratio = pub$relative_citation_ratio %||% NA,
+      citation_count          = pub$citation_count %||% NA))
+    all_data <- c(all_data, recs); i <- i + batch_size
+  }
+  bind_rows(all_data) |> mutate(pmid = as.character(pmid))
+}
+```
+
+```{r fetch_all_items_bibtex}
+#' Fetch all items of a Zotero collection as BibTeX
+#'
+#' @param library_type type der Library
+#' @param library_id id der Library
+#' @param api_key API-Key
+#' @param collection_key key der Collection
+#' @return BibTeX Text
+#' @export
+fetch_all_items_bibtex <- function(library_type, library_id, api_key, collection_key) {
+  base_url <- glue("https://api.zotero.org/{library_type}s/{library_id}/collections/{collection_key}/items")
+  start <- 0; limit <- 100; all_bib <- character(0)
+  while (TRUE) {
+    resp <- request(base_url) |>
+      req_url_query(format = "bibtex", key = api_key, start = start, limit = limit) |>
+      req_headers("Zotero-API-Version" = "3") |>
+      req_perform()
+    if (!resp_has_body(resp)) break
+    btxt <- resp_body_string(resp)
+    if (!nchar(btxt)) break
+    all_bib <- c(all_bib, btxt)
+    start <- start + limit
+  }
+  paste(all_bib, collapse = "\n")
+}
+```
+
+```{r normalize_doi}
+#' Normalize DOI string
+#'
+#' @param x DOI
+#' @return Normalisierte DOI
+#' @export
+normalize_doi <- function(x) gsub("/", "", tolower(trimws(x)))
+```
+
+```{r get_parent_doi}
+#' Get DOI of parent item
+#'
+#' @param att Attachment aus Zotero
+#' @param lib_id Library ID
+#' @param lib_type Library Type
+#' @param api_key API-Key
+#' @return DOI oder NA
+#' @export
+get_parent_doi <- function(att, lib_id, lib_type, api_key) {
+  if (is.null(att$data$parentItem) || att$data$parentItem == "")
+    return(NA_character_)
+  parent_key <- att$data$parentItem
+  p_url <- glue("https://api.zotero.org/{lib_type}s/{lib_id}/items/{parent_key}")
+  p_resp <- request(p_url) |> req_headers("Zotero-API-Key" = api_key) |> req_perform()
+  p_json <- resp_body_json(p_resp, simplifyVector = TRUE)
+  p_json$data$DOI %||% p_json$data$doi %||% NA_character_
+}
+```
+
+```{r insert_tldr_into_bib}
+#' Insert TLDR text into BibTeX file
+#'
+#' @param bib_content Inhalt der BibTeX-Datei
+#' @param tldr_df Datenrahmen mit Spalten doi und tldr
+#' @return Geänderter BibTeX Text
+#' @export
+insert_tldr_into_bib <- function(bib_content, tldr_df) {
+  lines <- str_split(bib_content, "\n")[[1]]
+  lines <- lines[!str_detect(lines, "^\\s*(annote|Notiz)\\s*=\\s*\\{")]
+  tldr_df$doi_norm <- normalize_doi(tldr_df$doi)
+  new_lines    <- character()
+  inside_entry <- FALSE
+  current_doi  <- NA
+  for (line in lines) {
+    if (str_detect(line, "^@\\w+\\{")) {
+      inside_entry <- TRUE
+      current_doi  <- NA
+    }
+    if (inside_entry && str_detect(line, "\\bdoi\\s*=\\s*\\{.+\\}")) {
+      current_doi <- str_replace(line, ".*doi\\s*=\\s*\\{([^}]+)\\}.*", "\\1") |>
+        normalize_doi()
+    }
+    if (inside_entry && str_detect(line, "^\\}\\s*$")) {
+      if (!is.na(current_doi)) {
+        hit <- tldr_df |> filter(doi_norm == current_doi)
+        if (nrow(hit) == 1) {
+          val <- hit$tldr[1] |>
+            str_replace_all("%", "\\\\%") |>
+            str_replace_all("[{}]", "")
+          new_lines <- c(new_lines,
+                         paste0("  annote = {", val, "},"))
+        }
+      }
+      inside_entry <- FALSE
+    }
+    new_lines <- c(new_lines, line)
+  }
+  paste(new_lines, collapse = "\n")
+}
+```
+
+```{r rename_bibkeys_to_doi}
+#' Rename BibTeX keys to DOI
+#'
+#' @param bib_content BibTeX Inhalt
+#' @return Angepasster BibTeX Text
+#' @export
+rename_bibkeys_to_doi <- function(bib_content) {
+  bib_lines   <- str_split(bib_content, "\n")[[1]]
+  start_idx   <- NULL
+  current_doi <- NULL
+  for (i in seq_along(bib_lines)) {
+    line <- bib_lines[i]
+    if (str_detect(line, "^@\\w+\\{")) {
+      start_idx   <- i
+      current_doi <- NULL
+    }
+    if (!is.null(start_idx) &&
+        str_detect(line,
+                   regex("\\bdoi\\s*=\\s*\\{[^}]+\\}", ignore_case = TRUE))) {
+      current_doi <- str_match(line, "\\{([^}]+)\\}")[, 2] |> trimws()
+    }
+    if (!is.null(start_idx) && str_detect(line, "^\\}\\s*$")) {
+      if (!is.null(current_doi)) {
+        old_line <- bib_lines[start_idx]
+        bib_lines[start_idx] <- str_replace(
+          old_line,
+          "^(@\\w+\\{)[^,]+",
+          paste0("\\1", current_doi)
+        )
+      }
+      start_idx   <- NULL
+      current_doi <- NULL
+    }
+  }
+  paste(bib_lines, collapse = "\n")
+}
+```
+
+
+
+## CONSORT und Analysefunktionen
+
+```{r simulate_raw_data}
+#' Simuliere Rohdaten für eine Studie
+#'
+#' @param n_patients Anzahl der Patienten
+#' @param randomised Ist die Studie randomisiert?
+#' @param seed Zufalls-Seed
+#' @return Datensatz mit simulierten Patienteninformationen
+#' @export
+simulate_raw_data <- function(n_patients = 200, randomised = TRUE, seed = 24) {
+  set.seed(seed)
+  exclusion_reasons <- c(
+    "MRI missing", "Consent withdrawn",
+    "Screen failure", "Other protocol violation"
+  )
+  tibble(id = sprintf("%03d", 1:n_patients)) |>
+    mutate(
+      eligible   = rbinom(n(), 1, 0.85) == 1,
+      randomised = if (randomised) eligible & (rbinom(n(), 1, 0.93) == 1) else FALSE,
+      analysed   = if (randomised) randomised & (rbinom(n(), 1, 0.95) == 1)
+                   else eligible & (rbinom(n(), 1, 0.95) == 1)
+    ) |>
+    mutate(
+      exclusion_reason = if_else(
+        !eligible,
+        sample(exclusion_reasons, n(), replace = TRUE),
+        NA_character_
+      )
+    ) |>
+    mutate(
+      treatment_arm = if (randomised) case_when(
+        randomised & (rbinom(n(), 1, 0.5) == 1) ~ "intervention",
+        randomised                              ~ "control",
+        TRUE                                    ~ NA_character_
+      ) else NA_character_,
+      primary_event = if_else(
+        analysed,
+        sample(c("yes", "no"), n(), replace = TRUE, prob = c(0.30, 0.70)),
+        NA_character_
+      ),
+      age = if_else(analysed, round(rnorm(n(), mean = 65, sd = 10)), NA_real_),
+      sex = if_else(analysed, sample(c("m", "f"), n(), replace = TRUE), NA_character_),
+      bmi = if_else(analysed, round(rnorm(n(), mean = 27, sd = 4), 1), NA_real_),
+      biomarker1 = if_else(analysed, round(rnorm(n(), mean = 3.5, sd = 1.2), 2), NA_real_),
+      biomarker2 = if_else(analysed, round(rlnorm(n(), meanlog = 1.2, sdlog = 0.5), 2), NA_real_)
+    )
+}
+```
+
+```{r generate_consort_plot}
+#' Erzeuge ein CONSORT-Diagramm
+#'
+#' @param raw_df Datensatz mit Studiendaten
+#' @param show_phase_labels Sollen Phasen-Labels angezeigt werden?
+#' @return consort-Plot-Objekt
+#' @export
+generate_consort_plot <- function(raw_df, show_phase_labels = TRUE) {
+  randomised_trial <- any(raw_df$randomised, na.rm = TRUE)
+  flow_df <- raw_df %>%
+    mutate(
+      excl_screen = if_else(!eligible, exclusion_reason, NA_character_),
+      included_id = if_else( eligible, id, NA_character_)
+    )
+  if (randomised_trial) {
+    flow_df <- flow_df %>%
+      mutate(
+        arm         = if_else( eligible & randomised, treatment_arm, NA_character_),
+        excl_fu     = if_else( randomised & !analysed, "Lost to follow-up", NA_character_),
+        analysed_id = if_else( analysed, id, NA_character_)
+      ) %>%
+      mutate(
+        included_id = if_else(!is.na(excl_screen), NA_character_, included_id),
+        arm         = if_else(!is.na(excl_screen), NA_character_, arm),
+        excl_fu     = if_else(!is.na(excl_screen), NA_character_, excl_fu),
+        analysed_id = if_else(!is.na(excl_screen) | !is.na(excl_fu), NA_character_, analysed_id)
+      )
+    side_vars  <- c("excl_screen", "excl_fu")
+    side_boxes <- side_vars[vapply(flow_df[side_vars], function(x) any(!is.na(x)), logical(1))]
+    orders <- list(
+      c(id          = "Assessed for eligibility"),
+      c(excl_screen = "Excluded\n(screening)"),
+      c(included_id = "Eligible"),
+      c(arm         = "Randomised"),
+      c(excl_fu     = "Lost to follow-up"),
+      c(analysed_id = "Analysed")
+    )
+    g <- consort_plot(
+      data       = flow_df,
+      orders     = orders,
+      allocation = "arm",
+      side_box   = side_boxes,
+      cex        = 0.9, text_width = 26
+    )
+  } else {
+    flow_df <- flow_df %>%
+      mutate(
+        excl_fu     = if_else( eligible & !analysed, "Lost to follow-up", NA_character_),
+        analysed_id = if_else( analysed, id, NA_character_)
+      ) %>%
+      mutate(
+        included_id = if_else(!is.na(excl_screen), NA_character_, included_id),
+        excl_fu     = if_else(!is.na(excl_screen), NA_character_, excl_fu),
+        analysed_id = if_else(!is.na(excl_screen) | !is.na(excl_fu), NA_character_, analysed_id)
+      )
+    side_vars  <- c("excl_screen", "excl_fu")
+    side_boxes <- side_vars[vapply(flow_df[side_vars], function(x) any(!is.na(x)), logical(1))]
+    orders <- list(
+      c(id          = "Assessed for eligibility"),
+      c(excl_screen = "Excluded\n(screening)"),
+      c(included_id = "Included in study"),
+      c(excl_fu     = "Lost to follow-up"),
+      c(analysed_id = "Analysed")
+    )
+    g <- consort_plot(
+      data       = flow_df,
+      orders     = orders,
+      side_box   = side_boxes,
+      cex        = 0.9, text_width = 26
+    )
+  }
+  if (show_phase_labels) {
+    side_vars   <- names(side_boxes)
+    main_orders <- Filter(function(o) !names(o) %in% side_vars, orders)
+    order_names <- vapply(main_orders, names, character(1))
+    row_map     <- setNames(seq_along(order_names), order_names)
+    row_vec <- c(
+      Screening   = unname(row_map["id"]),
+      Allocation  = unname(row_map["arm"]        + 1L),
+      `Follow-up` = unname(row_map["excl_fu"]    + 1L),
+      Analysis    = unname(row_map["analysed_id"]+ 1L)
+    )
+    row_vec <- row_vec[!is.na(row_vec)]
+    grid::grid.newpage()
+    graphics::plot(g)
+    if (length(row_vec)) {
+      max_row <- max(row_vec)
+      for (phase in names(row_vec)) {
+        y_pos <- grid::unit(1 - (row_vec[phase] - 0.5) / max_row, "npc")
+        grid::grid.text(
+          label = phase,
+          x     = grid::unit(0.02, "npc"),
+          y     = y_pos,
+          just  = c("centre", "centre"),
+          rot   = 90,
+          gp    = grid::gpar(col = "grey30", cex = 0.9, fontface = "bold")
+        )
+      }
+    }
+    invisible(g)
+  } else {
+    g
+  }
+}
+```
+
+```{r create_table_1}
+#' Erzeuge Table 1 mit gtsummary
+#'
+#' @param raw_df Datensatz mit Studiendaten
+#' @param png_file Optionaler PNG-Dateiname
+#' @param docx_file Optionaler DOCX-Dateiname
+#' @return gtsummary-Objekt
+#' @export
+create_table_1 <- function(raw_df, png_file = NULL, docx_file = NULL) {
+  tbl1_plot <- raw_df |>
+    gtsummary::tbl_summary(by = treatment_arm, include = c(age, sex)) |>
+    gtsummary::add_p(pvalue_fun = gtsummary::label_style_pvalue(digits = 2)) |>
+    gtsummary::add_overall() |>
+    gtsummary::add_n() |>
+    gtsummary::modify_header(label ~ "**Variable**") |>
+    gtsummary::modify_spanning_header(c("stat_1", "stat_2") ~ "**Intervention**") |>
+    gtsummary::modify_footnote(
+      gtsummary::all_stat_cols() ~ "Median (IQR) or Frequency (%)"
+    ) |>
+    gtsummary::modify_caption("**Table 1. Participant Characteristics**") |>
+    gtsummary::bold_labels()
+  if (!is.null(png_file)) {
+    tbl1_plot |>
+      bstfun::as_ggplot() |>
+      ggplot2::ggsave(filename = png_file, width = 7, height = 4, dpi = 300)
+  }
+  if (!is.null(docx_file)) {
+    tbl1_plot |>
+      gtsummary::as_gt() |>
+      apa7::apa_style() |>
+      gt::gtsave(docx_file)
+  }
+  tbl1_plot
+}
+```
+
+```{r create_fig_2}
+#' Erzeuge Beispielgrafik für Biomarker1
+#'
+#' @param raw_df Datensatz mit Studiendaten
+#' @param file Optionaler Dateiname für die PNG-Ausgabe
+#' @return ggplot2-Objekt
+#' @export
+create_fig_2 <- function(raw_df, file = NULL) {
+  fig2_plot <- raw_df |>
+    dplyr::filter(analysed == TRUE) |>
+    dplyr::select(treatment_arm, biomarker1) |>
+    ggstatsplot::ggbetweenstats(
+      x = treatment_arm,
+      y = biomarker1,
+      outlier.tagging = TRUE
+    )
+  if (!is.null(file)) {
+    ggplot2::ggsave(file, plot = fig2_plot, width = 7, height = 4, dpi = 300)
+  }
+  fig2_plot
+}
+```
+
+```{r setup_gitlab_project}
+#' Projektstruktur für apaquarto auf GitLab anlegen
+#'
+#' @param project_name Name des GitLab-Projekts
+#' @param description Kurzbeschreibung
+#' @param group_id ID der GitLab-Gruppe
+#' @param include_file Datei, die in index.qmd eingebunden wird
+#' @return Informationen zum angelegten Projekt
+#' @export
+setup_gitlab_project <- function(project_name, description, group_id = 1897,
+                                 include_file = "Draft-Test.qmd") {
+  apa7::install_apaquarto()
+  gitlabr::set_gitlab_connection(
+    gitlab_url    = "https://gitlab.ub.uni-bielefeld.de",
+    private_token = Sys.getenv("GITLAB_BIE_TOKEN")
+  )
+  proj_info <- gitlabr::gl_new_project(
+    name            = project_name,
+    description     = description,
+    namespace_id    = group_id,
+    visibility      = "private",
+    default_branch  = "main",
+    initialize_with_readme = FALSE
+  )
+  credentials::credential_approve(
+    list(
+      protocol = "https",
+      host     = "gitlab.ub.uni-bielefeld.de",
+      username = "git",
+      password = Sys.getenv("GITLAB_BIE_TOKEN")
+    )
+  )
+  if (!"origin" %in% gert::git_remote_list()$name) {
+    gert::git_remote_add("origin", proj_info$http_url_to_repo)
+  } else {
+    gert::git_remote_set_url(proj_info$http_url_to_repo, remote = "origin")
+  }
+  glue::glue(
+    "---\nformat: apaquarto-html\n---\n\n{{< include {include_file} >}}",
+    include_file = include_file,
+    .trim = FALSE
+  ) |>
+    readr::write_lines(here::here("index.qmd"))
+  glue::glue(
+    "pages:\n  stage: deploy\n  script:\n    - echo 'Nothing to do...'\n  artifacts:\n    paths:\n      - public\n    only:\n      - main",
+    .trim = FALSE
+  ) |>
+    readr::write_lines(here::here('.gitlab-ci.yml'))
+  glue::glue(
+    ".Rproj.user\n.Rhistory\n.RData\n.Ruserdata",
+    .trim = FALSE
+  ) |>
+    readr::write_lines(here::here('.gitignore'))
+  gert::git_push(set_upstream = TRUE)
+  invisible(proj_info)
+}
+```
